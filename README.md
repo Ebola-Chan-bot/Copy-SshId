@@ -1,32 +1,21 @@
-This is a a lame PowerShell implementation of OpenSSH's ssh-copy-id
+This is a lame PowerShell implementation of OpenSSH's Copy-SshId.
 
-ssh-copy-id is a PowerShell script that uses ssh to log into a remote machine and append missing keys from the
+`Copy-SshId` is a PowerShell function that uses ssh to log into a remote machine and append missing keys from the
 indicated identity file to that machine's `~/.ssh/authorized_keys` file. By default, it installs the key(s) stored in `$env:USERPROFILE\.ssh\id_rsa.pub`.
 
 Existing keys are skipped instead of being appended again.
 
 ---
 
-## Installation
+# Installation
 
 This is published as a module in the PowerShell Gallery.
 
-### Installing SSH-Copy-ID the easy way
+## Installing Copy-SshId the easy way
 
-    Install-Module -Name SSH-Copy-ID
+    Install-Module -Name Copy-SshId
 
-### Installing SSH-Copy-ID the hard way
-
-Copy the SSH-Copy-ID folder to any one of the module folders that's returned by `$Env:PSModulePath`. Then import SSH-Copy-ID into your PowerShell session. This may be necessary if you can't install the module using the PowerShell Gallery. 
-
-    PS> $Env:PSModulePath
-    C:\Users\n8tg\OneDrive\OneDrive Documents\WindowsPowerShell\Modules;C:\Program Files\WindowsPowerShell\Modules;C:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules
-
-    PS> Copy-Item -Path ".\SSH-Copy-ID\" -Destination "C:\Users\n8tg\OneDrive\OneDrive Documents\WindowsPowerShell\Modules" -Recurse
-
-    PS> Import-Module SSH-Copy-ID
-
-### Getting access to the PowerShell Gallery
+## Getting access to the PowerShell Gallery
 
 See: <https://docs.microsoft.com/en-us/powershell/scripting/gallery/overview?view=powershell-7.1>
 
@@ -35,9 +24,9 @@ See: <https://docs.microsoft.com/en-us/powershell/scripting/gallery/overview?vie
 
 ---
 
-## Usage
+# Usage
 
-### Parameters (PS Style)
+## Parameters (PS Style)
 
 Param | Mandatory | Default | Description
 ------|-----------|---------|------------
@@ -46,7 +35,7 @@ RemoteUser | No |(none) | Specifies which user's authorized_keys file that the k
 KeyFile | No | "$env:USERPROFILE\.ssh\id_rsa.pub" | A path of the keyfile to be installed. If the default file is missing, common public key names in `$env:USERPROFILE\.ssh` are searched automatically.
 RemotePort | No | 22 | SSH will attempt to connect to this port on the remote host.
 
-### Parameters (Unix Style)
+## Parameters (Unix Style)
 
 Param | Mandatory | Default | Description
 ------|-----------|---------|------------
@@ -57,31 +46,69 @@ $RemoteHost (Positional Parameter) | Yes | (none) | Specifies the IP or DNS name
 
 ---
 
-## Examples
+# Examples
 
-### Unix username style
+## Unix username style
 
-    ssh-copy-id root@172.16.1.10 
-    ssh-copy-id 172.16.1.10 -l root 
+    Copy-SshId root@172.16.1.10 
+    Copy-SshId 172.16.1.10 -l root 
 
-### Unix username style with a specified key file
+## Unix username style with a specified key file
 
-    ssh-copy-id root@172.16.1.10 -i C:\users\n8tg\SpecialKeyDir\key.pub
+    Copy-SshId root@172.16.1.10 -i C:\users\n8tg\SpecialKeyDir\key.pub
 
-### PowerShell parameter style with a username
+## PowerShell parameter style with a username
 
-    ssh-copy-id -RemoteHost 172.16.1.10 -RemoteUser root  
+    Copy-SshId -RemoteHost 172.16.1.10 -RemoteUser root  
 
-### PowerShell parameter style with a username and a specific key
+## PowerShell parameter style with a username and a specific key
 
-    ssh-copy-id -RemoteHost 172.16.1.10 -RemoteUser root -KeyFile C:\users\n8tg\SpecialKeyDir\key.pub
+    Copy-SshId -RemoteHost 172.16.1.10 -RemoteUser root -KeyFile C:\users\n8tg\SpecialKeyDir\key.pub
 
-### Windows OpenSSH server
+## Windows OpenSSH server
 
-    ssh-copy-id -RemoteHost windows.example.com -RemoteUser user
+    Copy-SshId -RemoteHost windows.example.com -RemoteUser user
 
-The remote platform is detected automatically. On Windows targets, ssh-copy-id reads `C:\ProgramData\ssh\sshd_config` and installs the key into the first applicable `AuthorizedKeysFile`, including settings under `Match Group administrators`.
+The remote platform is detected automatically. On Windows targets, Copy-SshId reads `C:\ProgramData\ssh\sshd_config` and installs the key into the first applicable `AuthorizedKeysFile`, including settings under `Match Group administrators`.
 
-### You can mix and match if you choose
+## You can mix and match if you choose
 
-    ssh-copy-id -RemoteHost root@172.16.1.10 -i c:\why\key.pub
+    Copy-SshId -RemoteHost root@172.16.1.10 -i c:\why\key.pub
+
+---
+
+# Remove-SshId — 移除免密登录
+
+`Remove-SshId` 通过 SSH 登录远程主机，从指定用户的 `authorized_keys` 文件中删除本机公钥。
+删除后，该远程主机将不再接受本机的免密登录，恢复为需要密码认证的状态。
+
+## 参数
+
+| 参数 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| RemoteHost | 是 | (无) | 目标主机的 IP 地址或 DNS 名称 |
+| RemoteUser | 否 | (无) | 目标主机上要移除免密登录许可的用户名 |
+| KeyFile | 否 | `$env:USERPROFILE\.ssh\id_rsa.pub` | 要移除的密钥文件路径 |
+| RemotePort | 否 | 22 | SSH 连接端口 |
+
+也支持 `-l`、`-i`、`-p` 别名和 `User@Host` 语法。
+
+## 示例
+
+### 移除 root 用户的免密登录
+
+    Remove-SshId root@172.16.1.10
+
+### 指定用户名和端口
+
+    Remove-SshId 192.168.1.100 -l admin -p 2222
+
+### 指定要移除的密钥文件
+
+    Remove-SshId -RemoteHost server.example.com -RemoteUser deploy -KeyFile C:\keys\deploy.pub
+
+### 移除 Windows OpenSSH 服务器上的免密登录
+
+    Remove-SshId -RemoteHost windows.example.com -RemoteUser user
+
+目标平台会被自动检测：Unix 下直接操作 `~/.ssh/authorized_keys`，Windows 下读取 `C:\ProgramData\ssh\sshd_config` 定位 `AuthorizedKeysFile` 并移除对应密钥。
