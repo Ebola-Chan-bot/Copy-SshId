@@ -12,6 +12,34 @@ function 请求-Ssh密码 {
         [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
 }
 
+# 密钥缺失时自动生成 ed25519 密钥对（无口令），返回公钥路径；失败返回 $null。
+# $公钥文件 为目标公钥路径（*.pub）；默认生成在 ~\.ssh\id_ed25519
+function 新建-Ssh密钥 {
+    param([string]$公钥文件 = (Join-Path $env:USERPROFILE '.ssh\id_ed25519.pub'))
+    if(-not (Get-Command ssh-keygen -ErrorAction SilentlyContinue)) {
+        Write-Warning '本机未找到 ssh-keygen，无法自动生成 SSH 密钥。请安装 OpenSSH 客户端，或手动执行 ssh-keygen -t ed25519 后重试。'
+        return $null
+    }
+    # ssh-keygen -f 需要不带 .pub 的私钥路径
+    $密钥路径 = $公钥文件 -replace '\.pub$', ''
+    if(Test-Path -LiteralPath $密钥路径 -PathType Leaf) {
+        Write-Warning "私钥已存在但缺少公钥（$公钥文件），无法自动补全，请手动处理。"
+        return $null
+    }
+    $密钥目录 = Split-Path -Parent $密钥路径
+    if($密钥目录 -and -not (Test-Path -LiteralPath $密钥目录)) {
+        $null = New-Item -Path $密钥目录 -ItemType Directory -ErrorAction SilentlyContinue
+    }
+    Write-Host "本机尚未生成 SSH 密钥，正在自动生成（ed25519，无口令）：$密钥路径"
+    $null = & ssh-keygen -t ed25519 -f $密钥路径 -N '""' 2>&1
+    if($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $公钥文件 -PathType Leaf)) {
+        Write-Warning '自动生成 SSH 密钥失败。可手动执行 ssh-keygen -t ed25519 后重试。'
+        return $null
+    }
+    Write-Host "SSH 密钥已生成：$公钥文件"
+    return $公钥文件
+}
+
 # 启动 askpass：密码写入进程环境变量，SSH_ASKPASS 指向模块内固定的辅助脚本
 function 启动-Askpass服务 {
     param([string]$密码)
@@ -33,10 +61,19 @@ function 停止-Askpass服务 {
 # 将 Windows PowerShell 脚本通过 stdin 管道传入远程执行（一次 SSH，无长度限制）
 # 注意：远端命令不要加双引号——PS 5.1 给原生 ssh.exe 传参时不保留内嵌双引号，
 # 脚本体不含空格可作为单个 argv 原样送达远端。
+# 远端默认 shell 若为 PowerShell，'powershell -Command $s=[Console]...;iex(...)'
+# 会被远端 PowerShell 先行解析展开而碎裂报 ParserError。
+# 因此内层引导命令改用 -EncodedCommand（纯 base64，无 $、括号、分号、空格），
+# 外层套 cmd /c：无论远端默认 shell 是 cmd 还是 PowerShell，命令都不会被二次拆解。
+# 末尾 2>NUL：远端 PowerShell 的进度信息（如 "Preparing modules for first use"）
+# 走 stderr 且以 CLIXML 序列化 XML 发送，ssh 会原样回传刷屏；安装成败以退出码为准，
+# 直接丢弃远端 stderr 即可。
 function 通过管道执行远程Windows脚本 {
     param([string]$脚本内容, [string[]]$SSH参数)
     $编码脚本 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($脚本内容))
-    $编码脚本 | ssh @SSH参数 'powershell -NoProfile -Command $s=[Console]::In.ReadToEnd();iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)))'
+    $引导命令 = '$s=[Console]::In.ReadToEnd();iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)))'
+    $编码引导 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($引导命令))
+    $编码脚本 | ssh @SSH参数 "cmd /c powershell -NoProfile -EncodedCommand $编码引导 2>NUL"
     return [int]$LASTEXITCODE
 }
 
@@ -167,7 +204,16 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
                 if($fallbackKeyFile) {
                     $KeyFile = $fallbackKeyFile
                     Write-Verbose "Using public key file '$KeyFile'."
+                } else {
+                    # 本机还没有任何 SSH 密钥：自动生成 ed25519 密钥对，再继续安装流程
+                    Write-Verbose '本机尚未生成任何 SSH 密钥，尝试自动生成……'
+                    $KeyFile = 新建-Ssh密钥
+                    if(-not $KeyFile) { return }
                 }
+            } else {
+                Write-Warning '未找到密钥文件，尝试在当前路径自动生成……'
+                $KeyFile = 新建-Ssh密钥 -公钥文件 $KeyFile
+                if(-not $KeyFile) { return }
             }
         }
 

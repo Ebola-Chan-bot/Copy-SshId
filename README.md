@@ -32,7 +32,7 @@ Param | Mandatory | Default | Description
 ------|-----------|---------|------------
 RemoteHost | Yes | (none) | Specifies the IP or DNS name of the machine to install the public key on.
 RemoteUser | No |(none) | Specifies which user's authorized_keys file that the key will be installed under.
-KeyFile | No | "$env:USERPROFILE\.ssh\id_rsa.pub" | A path of the keyfile to be installed. If the default file is missing, common public key names in `$env:USERPROFILE\.ssh` are searched automatically.
+KeyFile | No | "$env:USERPROFILE\.ssh\id_rsa.pub" | A path of the keyfile to be installed. If the default file is missing, common public key names in `$env:USERPROFILE\.ssh` are searched automatically. If no key exists at all, a new `ed25519` key pair is generated automatically (passphrase-less) before installation.
 RemotePort | No | 22 | SSH will attempt to connect to this port on the remote host.
 
 ## Parameters (Unix Style)
