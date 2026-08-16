@@ -58,23 +58,52 @@ function 停止-Askpass服务 {
     $env:DISPLAY = $null
 }
 
-# 将 Windows PowerShell 脚本通过 stdin 管道传入远程执行（一次 SSH，无长度限制）
-# 注意：远端命令不要加双引号——PS 5.1 给原生 ssh.exe 传参时不保留内嵌双引号，
-# 脚本体不含空格可作为单个 argv 原样送达远端。
-# 远端默认 shell 若为 PowerShell，'powershell -Command $s=[Console]...;iex(...)'
-# 会被远端 PowerShell 先行解析展开而碎裂报 ParserError。
-# 因此内层引导命令改用 -EncodedCommand（纯 base64，无 $、括号、分号、空格），
-# 外层套 cmd /c：无论远端默认 shell 是 cmd 还是 PowerShell，命令都不会被二次拆解。
-# 末尾 2>NUL：远端 PowerShell 的进度信息（如 "Preparing modules for first use"）
-# 走 stderr 且以 CLIXML 序列化 XML 发送，ssh 会原样回传刷屏；安装成败以退出码为准，
-# 直接丢弃远端 stderr 即可。
-function 通过管道执行远程Windows脚本 {
-    param([string]$脚本内容, [string[]]$SSH参数)
-    $编码脚本 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($脚本内容))
-    $引导命令 = '$s=[Console]::In.ReadToEnd();iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)))'
-    $编码引导 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($引导命令))
-    $编码脚本 | ssh @SSH参数 "cmd /c powershell -NoProfile -EncodedCommand $编码引导 2>NUL"
-    return [int]$LASTEXITCODE
+# 在远程 Windows 主机执行 PowerShell 脚本：scp 上传 + EncodedCommand 引导执行（不用 stdin 管道、不用超长命令行）。
+# 方案演进：
+#   1) stdin 管道（远端 [Console]::In.ReadToEnd()）：经 cpolar 等 NAT 隧道时 EOF 有时送达不了 → 永久挂起；
+#   2) 整脚本 base64 内嵌进 ssh 命令参数：脚 base64 后约 7KB，超 cmd 命令行 8191 上限
+#      → 'The command line is too long.'；
+#   3) 现行方案：脚本写本地临时文件 → scp -O 上传到远端用户目录（文件传输走数据通道，
+#      隧道下同样稳定）→ 一条短命令经 -EncodedCommand 引导执行（纯 base64，远端默认 shell
+#      无论是 cmd 还是 PowerShell 都不会拆解它），引导脚本执行完毕自行删除远端临时文件。
+function 通过scp执行远程Windows脚本 {
+    param([string]$脚本内容, [string[]]$SSH参数, [string]$远程用户, [string]$远程端口, [string]$远程主机)
+
+    $随机名 = 'sshcopyid_' + [guid]::NewGuid().ToString('N').Substring(0, 12) + '.ps1'
+    $本地临时文件 = Join-Path $env:TEMP $随机名
+    Set-Content -LiteralPath $本地临时文件 -Value $脚本内容 -Encoding UTF8
+
+    # 上传：-O 强制传统 SCP 协议（不依赖远端 sftp 子系统），目标路径相对远端用户目录
+    $scp参数 = @('-O', '-P', $远程端口)
+    if($远程用户){ $远程目标 = "${远程用户}@${远程主机}:$随机名" } else { $远程目标 = "${远程主机}:$随机名" }
+
+    try {
+        Write-Verbose "通过 scp 上传临时脚本到远程主机：$随机名"
+        $null = scp @scp参数 $本地临时文件 $远程目标 2>&1
+        if($LASTEXITCODE -ne 0){
+            Write-Warning 'scp 上传脚本文件失败。公钥未写入。'
+            return 1
+        }
+
+        # 引导脚本：执行已上传的文件 → 记录退出码 → 删除远端临时文件 → 原样返回退出码。
+        # 整体 -EncodedCommand 编码后只有纯 base64，远端任何 shell 都不会拆解；
+        # -ExecutionPolicy Bypass 保证文件执行不受远端执行策略限制。
+        $引导脚本模板 = @'
+$ProgressPreference = 'SilentlyContinue'
+$p = Join-Path $env:USERPROFILE '__REMOTE_SCRIPT_NAME__'
+& $p
+$ec = $LASTEXITCODE
+Remove-Item $p -Force -ErrorAction SilentlyContinue
+exit $ec
+'@
+        $引导脚本 = $引导脚本模板.Replace('__REMOTE_SCRIPT_NAME__', $随机名)
+        $编码引导 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($引导脚本))
+        Write-Verbose '执行引导：调用远程临时脚本并自清理'
+        ssh @SSH参数 "cmd /c powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $编码引导"
+        return [int]$LASTEXITCODE
+    } finally {
+        Remove-Item -LiteralPath $本地临时文件 -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # 通过 base64 参数在远程执行 sh 脚本：脚本整体 base64 编码后作为 ssh 参数，
@@ -315,7 +344,7 @@ rm -f "$tmp"
 
             # 第三步：按真实平台执行安装
             if($remotePlatform -eq 'Windows'){
-                $exitCode = 通过管道执行远程Windows脚本 $windowsScript $sshArguments
+                $exitCode = 通过scp执行远程Windows脚本 $windowsScript $sshArguments -远程用户 $RemoteUser -远程端口 $RemotePort -远程主机 $RemoteHost
             }else{
                 $exitCode = 通过base64执行远程sh脚本 $unixScript $sshArguments
             }
@@ -461,7 +490,8 @@ $转义密钥行
 __SSH_COPY_ID_KEYS__
 "@
 
-        # Windows 端移除命令：通过 stdin 管道传入脚本，远程 PowerShell 从 stdin 读取执行
+        # Windows 端移除：脚本经 scp 上传到远端用户目录，再由短引导命令
+        # （-EncodedCommand）调用执行；不依赖 stdin 管道、不受命令行长度限制
         $编码密钥文本 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($密钥文本))
         $Windows脚本 = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Uninstall-SshKey.ps1') -Raw).Replace('__ENCODED_KEY_TEXT__', $编码密钥文本)
 
@@ -491,7 +521,7 @@ __SSH_COPY_ID_KEYS__
             $远程平台 = 获取远程平台
             Write-Verbose "远程平台检测结果: $远程平台"
             if($远程平台 -eq 'Windows'){
-                $退出码 = 通过管道执行远程Windows脚本 $Windows脚本 $SSH参数
+                $退出码 = 通过scp执行远程Windows脚本 $Windows脚本 $SSH参数 -远程用户 $RemoteUser -远程端口 $RemotePort -远程主机 $RemoteHost
             }else{
                 $退出码 = 通过base64执行远程sh脚本 $Unix脚本 $SSH参数
             }

@@ -106,6 +106,51 @@ if (-not (Test-Path -LiteralPath $授权密钥文件路径)) {
     exit 0
 }
 
+# --- 可写性检测与权限修复 ---
+# 与 Install-SshKey.ps1 一致：administrators_authorized_keys 可能由 SYSTEM 持有，
+# 管理员会话写入也会 Access denied。先尝试 takeown + icacls 修复；恢复 sshd
+# 要求的严格 ACL；失败则提示用户手动处理，并直接退出（移除失败不能静默通过）。
+function Test-FileWritable {
+    param([string]$Path)
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::Write)
+        $fs.Close()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Repair-AuthorizedKeysAcl {
+    param([string]$Path)
+    try {
+        $null = & takeown.exe /f $Path 2>&1
+        if($LASTEXITCODE -ne 0) { return $false }
+        $null = & icacls.exe $Path /grant ($env:USERNAME + ':(F)') 2>&1
+        if($LASTEXITCODE -ne 0) { return $false }
+        $系统Sid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+        $管理员组Sid = New-Object System.Security.Principal.SecurityIdentifier($管理员Sid)
+        $访问控制列表 = New-Object System.Security.AccessControl.FileSecurity
+        $访问控制列表.SetOwner($管理员组Sid)
+        $访问控制列表.SetAccessRuleProtection($true, $false)
+        $访问控制列表.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($系统Sid, "FullControl", "Allow")))
+        $访问控制列表.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($管理员组Sid, "FullControl", "Allow")))
+        Set-Acl -LiteralPath $Path -AclObject $访问控制列表
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+if (-not (Test-FileWritable -Path $授权密钥文件路径)) {
+    Write-Warning "目标文件不可写：$授权密钥文件路径，尝试修复 ACL……"
+    $已修复 = Repair-AuthorizedKeysAcl -Path $授权密钥文件路径
+    if (-not $已修复 -or -not (Test-FileWritable -Path $授权密钥文件路径)) {
+        Write-Warning "修复 ACL 失败，无法写入目标文件。请在远程以管理员身份先运行：icacls `"$授权密钥文件路径`" /grant BUILTIN\Administrators:F  然后重试 Remove-SshId。"
+        exit 1
+    }
+}
+
 # 提取要移除密钥的材质（类型+Base64，不含注释）
 $要移除的密钥材质 = $要移除的密钥行 | ForEach-Object { ($_ -split '\s+')[0..1] -join ' ' }
 
@@ -116,14 +161,18 @@ $已有密钥 = @(Get-Content -LiteralPath $授权密钥文件路径 -ErrorActio
 # 以 UTF-8（无 BOM）编码写回文件
 [System.IO.File]::WriteAllLines($授权密钥文件路径, $已有密钥, [Text.UTF8Encoding]::new($false))
 
-# 如果写入的是 administrators_authorized_keys，修正文件 ACL
+# 如果写入的是 administrators_authorized_keys，修正文件 ACL；失败不视为移除失败（内容已更新）
 if ($是否为管理员 -and ([string]::Equals($授权密钥文件路径, (Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'), [System.StringComparison]::OrdinalIgnoreCase))) {
-    $系统Sid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
-    $管理员组Sid = New-Object System.Security.Principal.SecurityIdentifier($管理员Sid)
-    $访问控制列表 = New-Object System.Security.AccessControl.FileSecurity
-    $访问控制列表.SetOwner($管理员组Sid)
-    $访问控制列表.SetAccessRuleProtection($true, $false)
-    $访问控制列表.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($系统Sid, "FullControl", "Allow")))
-    $访问控制列表.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($管理员组Sid, "FullControl", "Allow")))
-    Set-Acl -LiteralPath $授权密钥文件路径 -AclObject $访问控制列表
+    try {
+        $系统Sid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+        $管理员组Sid = New-Object System.Security.Principal.SecurityIdentifier($管理员Sid)
+        $访问控制列表 = New-Object System.Security.AccessControl.FileSecurity
+        $访问控制列表.SetOwner($管理员组Sid)
+        $访问控制列表.SetAccessRuleProtection($true, $false)
+        $访问控制列表.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($系统Sid, "FullControl", "Allow")))
+        $访问控制列表.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($管理员组Sid, "FullControl", "Allow")))
+        Set-Acl -LiteralPath $授权密钥文件路径 -AclObject $访问控制列表
+    } catch {
+        Write-Warning "已更新 authorized_keys 内容，但恢复严格 ACL 失败：$_"
+    }
 }
