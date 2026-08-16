@@ -293,14 +293,23 @@ rm -f "$tmp"
 
         # 平台检测：只在【登录已成功】的前提下调用（此时连接必然已认证）。
         # cmd 执行成功(0 且含标记) → Windows；否则(非 0) → Unix。绝不再返回 Unknown。
+        # Windows 时用 reg.exe 探测 OpenSSH 默认 shell：cmd/powershell 均可安全执行 reg query，
+        # 不受远端默认 shell 差异影响（命令中无 $、无引号转义陷阱）。
+        # 返回 [PSCustomObject]：平台 ('Windows'/'Unix')、默认Shell ('PowerShell'/'cmd'/'')。
         function Get-RemotePlatform {
             $detectionOutput = ssh @sshArguments 'cmd /c echo __SSH_COPY_ID_WINDOWS__' 2>&1
             $detectionExitCode = [int]$LASTEXITCODE
             $detectionText = ($detectionOutput | Out-String)
-            if($detectionExitCode -eq 0 -and $detectionText -like '*__SSH_COPY_ID_WINDOWS__*') {
-                return 'Windows'
+            if($detectionExitCode -ne 0 -or $detectionText -notlike '*__SSH_COPY_ID_WINDOWS__*') {
+                return [PSCustomObject]@{ 平台 = 'Unix'; 默认Shell = '' }
             }
-            return 'Unix'
+            $regOutput = ssh @sshArguments 'reg query HKLM\SOFTWARE\OpenSSH /v DefaultShell' 2>&1
+            $regText = ($regOutput | Out-String)
+            $默认Shell = 'cmd'
+            if($regText -match 'powershell\.exe' -or $regText -match 'pwsh\.exe') {
+                $默认Shell = 'PowerShell'
+            }
+            return [PSCustomObject]@{ 平台 = 'Windows'; 默认Shell = $默认Shell }
         }
 
         $使用密码 = $false
@@ -339,11 +348,28 @@ rm -f "$tmp"
             Write-Verbose '登录成功。'
 
             # 第二步：登录成功后做平台检测（askpass 复用密码，不再弹密码）
-            $remotePlatform = Get-RemotePlatform
-            Write-Verbose "远程平台检测结果: $remotePlatform"
+            $检测结果 = Get-RemotePlatform
+            $remotePlatform = $检测结果.平台
+            Write-Verbose "远程平台检测结果: $remotePlatform（Windows 时默认 shell: $($检测结果.默认Shell)）"
 
             # 第三步：按真实平台执行安装
             if($remotePlatform -eq 'Windows'){
+                # Windows 且 OpenSSH 默认 shell 是 cmd 时，把它改成 PowerShell。
+                # 仅 Copy-SshId 负责设置；Remove-SshId 不会还原该配置（用户要求：一次改好，不再变回去）。
+                # best-effort：写 HKLM 需要管理员权限，无权限时只警告，不阻断密钥安装。
+                if($检测结果.默认Shell -eq 'cmd'){
+                    Write-Verbose '远程 OpenSSH 默认 shell 为 cmd，尝试切换为 PowerShell……'
+                    $切换脚本 = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Set-DefaultShell.ps1') -Raw
+                    $切换结果 = 通过scp执行远程Windows脚本 $切换脚本 $sshArguments -远程用户 $RemoteUser -远程端口 $RemotePort -远程主机 $RemoteHost 2>&1
+                    $切换文本 = ($切换结果 | Out-String)
+                    if($切换文本 -like '*SHELL_SET*'){
+                        Write-Host '远程 OpenSSH 默认 shell 已切换为 PowerShell（Remove-SshId 不会还原此设置）。'
+                    }elseif($切换文本 -like '*ALREADY_POWERSHELL*'){
+                        Write-Verbose '远程默认 shell 已经是 PowerShell，无需切换。'
+                    }else{
+                        Write-Warning "默认 shell 切换为 PowerShell 失败（$切换文本）。不影响密钥安装，继续。"
+                    }
+                }
                 $exitCode = 通过scp执行远程Windows脚本 $windowsScript $sshArguments -远程用户 $RemoteUser -远程端口 $RemotePort -远程主机 $RemoteHost
             }else{
                 $exitCode = 通过base64执行远程sh脚本 $unixScript $sshArguments

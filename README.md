@@ -32,7 +32,7 @@ Param | Mandatory | Default | Description
 ------|-----------|---------|------------
 RemoteHost | Yes | (none) | Specifies the IP or DNS name of the machine to install the public key on.
 RemoteUser | No |(none) | Specifies which user's authorized_keys file that the key will be installed under.
-KeyFile | No | "$env:USERPROFILE\.ssh\id_rsa.pub" | A path of the keyfile to be installed. If the default file is missing, common public key names in `$env:USERPROFILE\.ssh` are searched automatically. If no key exists at all, a new `ed25519` key pair is generated automatically (passphrase-less) before installation.
+KeyFile | No | "$env:USERPROFILE\.ssh\id_rsa.pub" | A path of the keyfile to be installed. If the default file is missing, common public key names in `$env:USERPROFILE\.ssh` are searched automatically. 若本机完全没有密钥，安装前会自动生成无口令的 `ed25519` 密钥对。
 RemotePort | No | 22 | SSH will attempt to connect to this port on the remote host.
 
 ## Parameters (Unix Style)
@@ -70,6 +70,8 @@ $RemoteHost (Positional Parameter) | Yes | (none) | Specifies the IP or DNS name
     Copy-SshId -RemoteHost windows.example.com -RemoteUser user
 
 The remote platform is detected automatically. On Windows targets, Copy-SshId reads `C:\ProgramData\ssh\sshd_config` and installs the key into the first applicable `AuthorizedKeysFile`, including settings under `Match Group administrators`.
+
+此外，若远程 sshd 的默认登录 shell 是 `cmd`，Copy-SshId 会将其改为 PowerShell（`HKLM:\SOFTWARE\OpenSSH\DefaultShell`）。此操作需要管理员权限；若无权限，仅显示警告并继续安装公钥。`Remove-SshId` 不会还原此设置。
 
 ## You can mix and match if you choose
 
