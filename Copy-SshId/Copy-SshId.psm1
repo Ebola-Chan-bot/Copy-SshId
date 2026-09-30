@@ -74,7 +74,10 @@ function 通过scp执行远程Windows脚本 {
     Set-Content -LiteralPath $本地临时文件 -Value $脚本内容 -Encoding UTF8
 
     # 上传：-O 强制传统 SCP 协议（不依赖远端 sftp 子系统），目标路径相对远端用户目录；加密附加参数让 scp 走与 ssh 相同的 AEAD 加密，避开同样的 MAC 不兼容问题
-    $scp参数 = @('-O', '-P', $远程端口) + $加密附加参数
+    # 端口为空时绝不能传 -P：scp 的 -P 与 ssh 的 -p 一样会覆盖 ~/.ssh/config 里该 Host 的 Port 配置，导致连错端口
+    $scp参数 = @('-O')
+    if($远程端口){ $scp参数 += @('-P', $远程端口) }
+    $scp参数 += $加密附加参数
     if($远程用户){ $远程目标 = "${远程用户}@${远程主机}:$随机名" } else { $远程目标 = "${远程主机}:$随机名" }
 
     try {
@@ -270,7 +273,7 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
 
         [Alias('p')]
         [string]
-        $RemotePort = 22,
+        $RemotePort,
 
         [Alias('i')]
         [string]
@@ -322,7 +325,12 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
 
         if(!(Test-Path -LiteralPath $KeyFile -PathType Leaf)) { Write-Warning "Specified key file not found"; return }
 
-        $sshArguments = @('-p', $RemotePort)
+        # RemotePort 无默认值：只有用户显式传了 -p/-RemotePort 才向 ssh 加 -p，否则不传端口参数，由 ssh 自己从 ~/.ssh/config 的对应 Host 块读取 Port（缺省时才是 22）。
+        # 这一点必须严格遵守：ssh 命令行的 -p 优先级高于 config 的 Port，只要硬编码传一个 -p 22，就会把 config 里配好的非标准端口（例如 Port 22112）盖掉，导致连接超时，而且超时会被后面的误判逻辑报成“密码错误”，极难排查。
+        $sshArguments = @()
+        if($PSBoundParameters.ContainsKey('RemotePort')){
+            $sshArguments += @('-p', $RemotePort)
+        }
         if($RemoteUser){
             $sshArguments += @('-l', $RemoteUser)
         }
@@ -393,10 +401,13 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
                 if($loginText -match 'Corrupted MAC|message authentication code incorrect'){
                     # 走到这里说明已由探测阶段自动切换 AEAD 重试后仍然 MAC 损坏，属于更严重的加密层不兼容。这不是密码错误，必须如实报出，绝不能误报成密码错误让用户反复试密码。
                     Write-Warning '加密通道 MAC 校验失败（非密码错误）：自动切换 AEAD 加密后仍无法避开，属于本机 OpenSSH 与该服务器的严重不兼容。请升级本机 OpenSSH 客户端，或联系服务器管理员检查 sshd 的加密配置。'
+                }elseif($loginText -match 'Connection timed out|Connection refused|Could not resolve hostname|No route to host|Network is unreachable'){
+                    # 连接层失败：根本没走到认证，密码是对是错都还无从判断。这类错误绝不能归为“密码错误”，否则用户会反复去改正确的密码，而真正的问题（最常见是端口不对，其次才是防火墙/主机不可达）永远被掩盖。
+                    Write-Warning "无法建立 SSH 连接（端口不通或主机不可达），根本没到认证阶段，因此无法判断密码对错。未进行任何平台操作。请确认端口：若该主机在 ~/.ssh/config 里配了非标准 Port，请用 -p 指定（如 -p 22112），或检查目标主机与网络。\n实际错误：$loginText"
                 }elseif($loginText -match 'Not allowed|Connection closed|Connection reset|kex_exchange_identification'){
                     Write-Warning '服务器在认证前主动断开了连接（可能是 fail2ban/防火墙临时封禁或访问控制）。请稍后重试、更换网络或联系管理员。'
                 }else{
-                    Write-Warning '密码认证失败（密码错误）。未进行任何平台操作。'
+                    Write-Warning "密码认证失败（密码错误）。未进行任何平台操作。\n实际错误：$loginText"
                 }
                 return
             }
@@ -508,7 +519,7 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
 
         [Alias('p')]
         [string]
-        $RemotePort = 22,
+        $RemotePort,
 
         [Alias('i')]
         [string]
@@ -545,7 +556,11 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
             $密钥文本 = Get-Content -LiteralPath $KeyFile -Raw
         }
 
-        $SSH参数 = @('-p', $RemotePort)
+        # 同 Copy-SshId：不传默认的 -p 22，让 ssh 从 ~/.ssh/config 的对应 Host 块读取 Port，避免硬编码端口盖掉用户配置导致连接超时
+        $SSH参数 = @()
+        if($PSBoundParameters.ContainsKey('RemotePort')){
+            $SSH参数 += @('-p', $RemotePort)
+        }
         if($RemoteUser){
             $SSH参数 += @('-l', $RemoteUser)
         }
