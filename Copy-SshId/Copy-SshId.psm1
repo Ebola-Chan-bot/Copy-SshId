@@ -12,12 +12,13 @@ function 请求-Ssh密码 {
         [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
 }
 
-# 密钥缺失时自动生成 ed25519 密钥对（无口令），返回公钥路径；失败返回 $null。
-# $公钥文件 为目标公钥路径（*.pub）；默认生成在 ~\.ssh\id_ed25519
+# 密钥缺失时自动生成密钥对（无口令），返回公钥路径；失败返回 $null。
+# $公钥文件 为目标公钥路径（*.pub）；未指定时按 $密钥类型 生成在 ~\.ssh\id_<密钥类型>。$密钥类型 可取 ed25519（默认）/rsa/dsa/ecdsa：过老的服务器（如 OpenSSH 5.x）不支持 ed25519，此时调用方应传 rsa。
 function 新建-Ssh密钥 {
-    param([string]$公钥文件 = (Join-Path $env:USERPROFILE '.ssh\id_ed25519.pub'))
+    param([string]$密钥类型 = 'ed25519', [string]$公钥文件)
+    if(-not $公钥文件){ $公钥文件 = Join-Path $env:USERPROFILE (".ssh\id_$密钥类型.pub") }
     if(-not (Get-Command ssh-keygen -ErrorAction SilentlyContinue)) {
-        Write-Warning '本机未找到 ssh-keygen，无法自动生成 SSH 密钥。请安装 OpenSSH 客户端，或手动执行 ssh-keygen -t ed25519 后重试。'
+        Write-Warning "本机未找到 ssh-keygen，无法自动生成 SSH 密钥。请安装 OpenSSH 客户端，或手动执行 ssh-keygen -t $密钥类型 后重试。"
         return $null
     }
     # ssh-keygen -f 需要不带 .pub 的私钥路径
@@ -30,10 +31,10 @@ function 新建-Ssh密钥 {
     if($密钥目录 -and -not (Test-Path -LiteralPath $密钥目录)) {
         $null = New-Item -Path $密钥目录 -ItemType Directory -ErrorAction SilentlyContinue
     }
-    Write-Host "本机尚未生成 SSH 密钥，正在自动生成（ed25519，无口令）：$密钥路径"
-    $null = & ssh-keygen -t ed25519 -f $密钥路径 -N '""' 2>&1
+    Write-Host "本机尚未生成 SSH 密钥，正在自动生成（$密钥类型，无口令）：$密钥路径"
+    $null = & ssh-keygen -t $密钥类型 -f $密钥路径 -N '""' 2>&1
     if($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $公钥文件 -PathType Leaf)) {
-        Write-Warning '自动生成 SSH 密钥失败。可手动执行 ssh-keygen -t ed25519 后重试。'
+        Write-Warning "自动生成 SSH 密钥失败。可手动执行 ssh-keygen -t $密钥类型 后重试。"
         return $null
     }
     Write-Host "SSH 密钥已生成：$公钥文件"
@@ -172,26 +173,111 @@ function 写入-Umac降权配置 {
     }
 }
 
-# 探测免密登录的同时自动检测并修复加密算法不兼容：本机 Win32-OpenSSH（9.x）与部分新版服务器（如禁用 chacha20 的 OpenSSH 10.x）协商出 aes*-ctr + umac-*-etm 组合时，客户端 MAC 计算缺陷会导致 "Corrupted MAC on input" / "message authentication code incorrect"，在认证阶段断连——与密码、公钥存在与否均无关。检测到该特征时自动改用 AEAD 加密（aes-gcm，自带完整性校验、不走独立 MAC 通路）重试探测，同时把 umac 降权持久化写进用户级 ssh config，全程不需要用户手动修改任何配置。
-# 返回 [PSCustomObject]：免密输出、免密退出码（生效参数下的探测结果，调用方直接复用避免重复连接）、附加参数（空数组表示无需修复或自动修复失败，调用方应将其前置到 SSH 参数数组开头，即主机名之前）。
+# 为指定主机在用户级 ~/.ssh/config 写入旧算法兼容块：老服务器（典型如 OpenSSH 5.x）只提供 ssh-rsa/ssh-dss 旧版主机密钥/公钥签名算法，新版客户端默认不再接受，报 "Unable to negotiate ... no matching host key type found" 协商失败。启用旧算法属于在该主机上重新接受 SHA-1 时代签名，因此按主机限定写入而不是 Host *，不影响其他主机的安全默认值。幂等：标记含主机名，已写过则跳过；首次修改前备份；按字节 UTF-8 无 BOM 追加（保留中文主机名、不写 BOM）。返回 $true=本次新写入，$false=已存在或写入失败（原因已 Warning）。
+function 写入-主机密钥兼容配置 {
+    param([string]$主机名)
+    if([string]::IsNullOrWhiteSpace($主机名)){ return $false }
+    $SSH目录 = Join-Path $env:USERPROFILE '.ssh'
+    $config路径 = Join-Path $SSH目录 'config'
+    $起始标记 = "# BEGIN Copy-SshId HOSTKEY-FIX $主机名"
+    $结束标记 = "# END Copy-SshId HOSTKEY-FIX $主机名"
+    $配置块行 = @(
+        $起始标记,
+        '# 由 Copy-SshId 模块自动写入：该主机的 SSH 服务器过老，只提供 ssh-rsa/ssh-dss 等旧版算法，新版客户端默认不再接受，会报 no matching host key type found 协商失败。下面仅为该主机启用旧算法（HostKeyAlgorithms 管主机密钥验证，PubkeyAcceptedAlgorithms 管用户公钥签名），其他主机不受影响；删掉本块即恢复默认行为。',
+        "Host $主机名",
+        '    HostKeyAlgorithms +ssh-rsa,ssh-dss',
+        '    PubkeyAcceptedAlgorithms +ssh-rsa,ssh-dss',
+        $结束标记
+    )
+
+    if(-not (Test-Path -LiteralPath $SSH目录)){
+        $null = New-Item -Path $SSH目录 -ItemType Directory -ErrorAction SilentlyContinue
+    }
+
+    $现有内容 = ''
+    if(Test-Path -LiteralPath $config路径){
+        $现有内容 = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($config路径))
+        if($现有内容.Contains($起始标记)){
+            Write-Verbose "用户级 ssh config 中已存在 $主机名 的旧算法兼容块，跳过写入。"
+            return $false
+        }
+    }
+
+    # ssh_config 每个关键字首匹配生效：若已有本模块块之外的算法指令，追加块可能被盖住，必须如实告知而不是假装修好了
+    $剔除本模块块 = [regex]::Replace($现有内容, '(?ms)^# BEGIN Copy-SshId HOSTKEY-FIX .*?^# END Copy-SshId HOSTKEY-FIX .*\r?\n?', '')
+    if($剔除本模块块 -match '(?m)^\s*(HostKeyAlgorithms|PubkeyAcceptedAlgorithms|PubkeyAcceptedKeyTypes)'){
+        Write-Warning "检测到 $config路径 中已存在主机密钥/公钥算法指令：ssh 配置首个匹配生效，自动追加的兼容块可能被它覆盖而不生效。请人工检查该指令，未进行自动写入。"
+        return $false
+    }
+
+    try{
+        if($现有内容){
+            Copy-Item -LiteralPath $config路径 -Destination "$config路径.Copy-SshId备份_$(Get-Date -Format 'yyyyMMdd_HHmmss')" -ErrorAction Stop
+            Write-Verbose "已备份原 ssh config 后再修改。"
+        }
+        # 保证既有内容与新块之间有空行分隔，且原文件不以换行结尾时先补一个换行，避免把最后一行粘连进新块
+        $前置分隔 = if($现有内容){ if($现有内容.EndsWith("`n")){ "`r`n" } else { "`r`n`r`n" } } else { '' }
+        $待追加文本 = $前置分隔 + ($配置块行 -join "`r`n") + "`r`n"
+        $追加字节 = [Text.Encoding]::UTF8.GetBytes($待追加文本)
+        $现有字节 = if($现有内容){ [IO.File]::ReadAllBytes($config路径) } else { [byte[]]@() }
+        [IO.File]::WriteAllBytes($config路径, $现有字节 + $追加字节)
+        Write-Host "已自动为 $主机名 启用旧版密钥算法兼容（用户级 ssh config），终端里手敲的裸 ssh/scp/git 命令也将一并生效。"
+        return $true
+    }catch{
+        Write-Warning "自动写入 ssh config 失败：$($_.Exception.Message)"
+        return $false
+    }
+}
+
+# 探测免密登录的同时自动检测并修复两类兼容性问题，全程自动（含自动写用户级 ssh config），不把修复步骤丢给用户：
+#   1) 主机密钥类型协商失败：老服务器（如 OpenSSH 5.x）只提供 ssh-rsa/ssh-dss，新版客户端默认不再接受，报 "Unable to negotiate ... no matching host key type found"。自动改用旧算法参数重试并写 config（见 写入-主机密钥兼容配置）；这类服务器也不支持 ed25519 用户公钥，故同时置 旧服务器 标志，调用方应改用 RSA 密钥。
+#   2) umac MAC 计算缺陷：协商到 umac-*-etm 时报 "Corrupted MAC on input"。自动改用 AEAD 加密重试并全局降权 umac 写 config（见 写入-Umac降权配置）。
+# 返回 [PSCustomObject]：免密输出、免密退出码（生效参数下的最终探测结果，调用方直接复用避免重复连接）、附加参数（调用方应将其前置到 SSH 参数数组开头，即主机名之前）、旧服务器（$true=服务器过老，用户公钥须用 RSA/DSA 而非 ed25519）。
 function 探测免密登录并修复加密 {
     param([string[]]$SSH参数)
+    $主机名 = $SSH参数[-1]
     $AEAD参数 = @('-o', 'Ciphers=aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes192-ctr,aes256-ctr')
-    $输出 = ssh -o BatchMode=yes @SSH参数 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1 | Out-String
-    $退出码 = [int]$LASTEXITCODE
+    $旧算法参数 = @('-o', 'HostKeyAlgorithms=+ssh-rsa,ssh-dss', '-o', 'PubkeyAcceptedAlgorithms=+ssh-rsa,ssh-dss')
     $附加参数 = @()
+
+    # 旧服务器标志：本次探测命中协商失败、或之前已为该主机写过兼容块（否则第二次运行会因协商已修好而漏判，误把 ed25519 装到不支持它的老服务器上）
+    $旧服务器 = $false
+    $config路径 = Join-Path (Join-Path $env:USERPROFILE '.ssh') 'config'
+    if(Test-Path -LiteralPath $config路径){
+        $配置内容 = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($config路径))
+        if($配置内容.Contains("# BEGIN Copy-SshId HOSTKEY-FIX $主机名")){ $旧服务器 = $true }
+    }
+
+    # -Width 65535 必须加：Out-String 默认按控制台宽度（约120）折行，会在长错误消息中间插 CR+LF，把 "no matching host key type" 拆成 "ty\r\npe" 导致下方正则永远匹配不上
+    $输出 = ssh -o BatchMode=yes @SSH参数 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1 | Out-String -Width 65535
+    $退出码 = [int]$LASTEXITCODE
+
+    if($输出 -match 'no matching host key type'){
+        $旧服务器 = $true
+        Write-Verbose '检测到主机密钥类型协商失败：服务器只提供 ssh-rsa/ssh-dss 等旧算法，自动启用兼容参数并重试…'
+        $null = 写入-主机密钥兼容配置 -主机名 $主机名
+        $附加参数 += $旧算法参数
+        $输出 = ssh -o BatchMode=yes @附加参数 @SSH参数 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1 | Out-String -Width 65535
+        $退出码 = [int]$LASTEXITCODE
+        if($输出 -match 'no matching host key type'){
+            return [PSCustomObject]@{ 免密输出 = $输出; 免密退出码 = $退出码; 附加参数 = $附加参数; 旧服务器 = $旧服务器 }
+        }
+        Write-Host '已自动修复主机密钥类型协商问题（已为该主机启用 ssh-rsa/ssh-dss 旧算法兼容），无需修改任何配置文件。'
+    }
+
     if($输出 -match 'Corrupted MAC|message authentication code incorrect'){
         Write-Verbose '检测到加密层 MAC 校验失败：本机 OpenSSH 的 umac 实现缺陷被触发，自动降权 umac 并改用 AEAD 加密优先重试…'
         # 会话内附加参数只能修复模块自身发起的连接，用户在终端手敲的裸命令拿不到这些参数，因此必须同时把降权配置持久化进用户级 ssh config，两边一起生效
         $null = 写入-Umac降权配置
-        $输出 = ssh -o BatchMode=yes @AEAD参数 @SSH参数 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1 | Out-String
+        $附加参数 += $AEAD参数
+        $输出 = ssh -o BatchMode=yes @附加参数 @SSH参数 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1 | Out-String -Width 65535
         $退出码 = [int]$LASTEXITCODE
         if($输出 -notmatch 'Corrupted MAC|message authentication code incorrect'){
-            $附加参数 = $AEAD参数
             Write-Host '已自动修复与服务器的加密算法不兼容（本会话强制 AEAD 加密）。'
         }
     }
-    return [PSCustomObject]@{ 免密输出 = $输出; 免密退出码 = $退出码; 附加参数 = $附加参数 }
+
+    return [PSCustomObject]@{ 免密输出 = $输出; 免密退出码 = $退出码; 附加参数 = $附加参数; 旧服务器 = $旧服务器 }
 }
 
 function Copy-SshId
@@ -327,7 +413,8 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
 
         # RemotePort 无默认值：只有用户显式传了 -p/-RemotePort 才向 ssh 加 -p，否则不传端口参数，由 ssh 自己从 ~/.ssh/config 的对应 Host 块读取 Port（缺省时才是 22）。
         # 这一点必须严格遵守：ssh 命令行的 -p 优先级高于 config 的 Port，只要硬编码传一个 -p 22，就会把 config 里配好的非标准端口（例如 Port 22112）盖掉，导致连接超时，而且超时会被后面的误判逻辑报成“密码错误”，极难排查。
-        $sshArguments = @()
+        # StrictHostKeyChecking=accept-new：首次连接的新主机密钥自动信任（等同用户在提示里敲 yes，已知主机密钥被篡改时仍会拒绝，不削弱防中间人）。必须显式加，否则 ssh 首次连会问 yes/no，而该提示被本模块 2>&1 捕获藏进输出流，ssh 却仍在等终端输入，造成隐式卡死。
+        $sshArguments = @('-o', 'StrictHostKeyChecking=accept-new')
         if($PSBoundParameters.ContainsKey('RemotePort')){
             $sshArguments += @('-p', $RemotePort)
         }
@@ -336,18 +423,23 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
         }
         $sshArguments += $RemoteHost
 
-        # Unix 安装脚本存于模块目录 Install-SshKey.sh：公钥经 heredoc 内嵌进 sh 脚本（占位符 __KEYS__），整体 base64 后作为 ssh 参数在远端解码执行。
-        # 脚本本身在安装公钥的同时会清理 authorized_keys 中的异常行（空行、不以合法公钥算法前缀开头的噪声行），保留合法公钥行并整体去重后原子写回。
-        $keyText = Get-Content -LiteralPath $KeyFile -Raw
-        $keyLines = @($keyText -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        if($keyLines.Count -eq 0){ Write-Warning "公钥文件为空"; return }
-        $escapedKeyLines = $keyLines -join "`n"
-        # 把公钥内容填进 heredoc 占位符（避免在脚本文件里做复杂转义）
-        $unixScript = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Install-SshKey.sh') -Raw).Replace('__KEYS__', $escapedKeyLines)
-
-        $keyText = Get-Content -LiteralPath $KeyFile -Raw
-        $encodedKeyText = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($keyText))
-        $windowsScript = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Install-SshKey.ps1') -Raw).Replace('__ENCODED_KEY_TEXT__', $encodedKeyText)
+        # 安装脚本构建（Unix 脚本存于模块目录 Install-SshKey.sh、Windows 脚本存于 Install-SshKey.ps1，公钥经占位符内嵌）。做成函数是因为老服务器会中途换用 RSA 密钥，换完必须按新公钥重新构建脚本。
+        # Unix 脚本本身在安装公钥的同时会清理 authorized_keys 中的异常行（空行、不以合法公钥算法前缀开头的噪声行），保留合法公钥行并整体去重后原子写回。
+        function 生成-安装脚本 {
+            param([string]$公钥路径)
+            $密钥文本 = Get-Content -LiteralPath $公钥路径 -Raw
+            $密钥行 = @($密钥文本 -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if($密钥行.Count -eq 0){ return $null }
+            # 把公钥内容填进 heredoc 占位符（避免在脚本文件里做复杂转义）
+            $unix脚本 = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Install-SshKey.sh') -Raw).Replace('__KEYS__', ($密钥行 -join "`n"))
+            $编码密钥文本 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($密钥文本))
+            $win脚本 = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Install-SshKey.ps1') -Raw).Replace('__ENCODED_KEY_TEXT__', $编码密钥文本)
+            return [PSCustomObject]@{ Unix脚本 = $unix脚本; Windows脚本 = $win脚本 }
+        }
+        $安装脚本 = 生成-安装脚本 $KeyFile
+        if(-not $安装脚本){ Write-Warning "公钥文件为空"; return }
+        $unixScript = $安装脚本.Unix脚本
+        $windowsScript = $安装脚本.Windows脚本
 
         # 平台检测：只在【登录已成功】的前提下调用（此时连接必然已认证）。
         # cmd 执行成功(0 且含标记) → Windows；否则(非 0) → Unix。绝不再返回 Unknown。
@@ -357,12 +449,12 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
         function Get-RemotePlatform {
             $detectionOutput = ssh @sshArguments 'cmd /c echo __SSH_COPY_ID_WINDOWS__' 2>&1
             $detectionExitCode = [int]$LASTEXITCODE
-            $detectionText = ($detectionOutput | Out-String)
+            $detectionText = ($detectionOutput | Out-String -Width 65535)
             if($detectionExitCode -ne 0 -or $detectionText -notlike '*__SSH_COPY_ID_WINDOWS__*') {
                 return [PSCustomObject]@{ 平台 = 'Unix'; 默认Shell = '' }
             }
             $regOutput = ssh @sshArguments 'reg query HKLM\SOFTWARE\OpenSSH /v DefaultShell' 2>&1
-            $regText = ($regOutput | Out-String)
+            $regText = ($regOutput | Out-String -Width 65535)
             $默认Shell = 'cmd'
             if($regText -match 'powershell\.exe' -or $regText -match 'pwsh\.exe') {
                 $默认Shell = 'PowerShell'
@@ -385,9 +477,35 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
                 return
             }
 
+            # 老服务器（如 OpenSSH 5.x）不支持 ed25519/ecdsa 用户公钥（6.5 才引入），装上去也永远无法免密；自动改用 RSA 密钥（本机没有就生成），否则整个安装毫无意义
+            if($探测结果.旧服务器){
+                $公钥类型 = ((Get-Content -LiteralPath $KeyFile -Raw).Trim() -split '\s+')[0]
+                if($公钥类型 -notin @('ssh-rsa','ssh-dss')){
+                    Write-Host "检测到目标服务器过老，不支持 $公钥类型 公钥，自动改用 RSA 密钥……"
+                    $rsa公钥 = Join-Path $env:USERPROFILE '.ssh\id_rsa.pub'
+                    if(-not (Test-Path -LiteralPath $rsa公钥 -PathType Leaf)){
+                        $rsa公钥 = 新建-Ssh密钥 -密钥类型 rsa -公钥文件 $rsa公钥
+                        if(-not $rsa公钥){ return }
+                    }
+                    $KeyFile = $rsa公钥
+                    $安装脚本 = 生成-安装脚本 $KeyFile
+                    if(-not $安装脚本){ Write-Warning "公钥文件为空"; return }
+                    $unixScript = $安装脚本.Unix脚本
+                    $windowsScript = $安装脚本.Windows脚本
+                    Write-Host "已改用 RSA 密钥（$KeyFile）进行安装。"
+                }
+            }
+
             # 免密失败：收集一次密码，启动 askpass 服务，之后所有连接复用该密码
             Write-Verbose '免密不可用，改用密码（将只询问一次，后续连接复用）。'
-            $密码 = 请求-Ssh密码 -目标描述 "$RemoteUser@$RemoteHost"
+            # 密码提示显示真实的登录用户：用户没显式传 -l 时 ssh 会用 ~/.ssh/config 里该 Host 的 User，用 ssh -G 解析出来，避免提示显示成 "@主机名"
+            $显示用户 = $RemoteUser
+            if(-not $显示用户){
+                $用户行 = ssh -G @sshArguments 2>$null | Select-String -Pattern '^user\s+(\S+)' | Select-Object -First 1
+                if($用户行){ $显示用户 = $用户行.Matches[0].Groups[1].Value }
+            }
+            if(-not $显示用户){ $显示用户 = $RemoteHost }
+            $密码 = 请求-Ssh密码 -目标描述 "$显示用户@$RemoteHost"
             启动-Askpass服务 -密码 $密码
             $密码 = $null   # 明文只留在 pipe 服务 runspace 里，主作用域立即清除
             $使用密码 = $true
@@ -396,18 +514,21 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
             Write-Verbose '正在用密码登录远程主机…'
             $loginOutput = ssh @sshArguments 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1
             $loginExit = [int]$LASTEXITCODE
-            $loginText = ($loginOutput | Out-String)
+            $loginText = ($loginOutput | Out-String -Width 65535)
             if($loginExit -ne 0){
                 if($loginText -match 'Corrupted MAC|message authentication code incorrect'){
                     # 走到这里说明已由探测阶段自动切换 AEAD 重试后仍然 MAC 损坏，属于更严重的加密层不兼容。这不是密码错误，必须如实报出，绝不能误报成密码错误让用户反复试密码。
                     Write-Warning '加密通道 MAC 校验失败（非密码错误）：自动切换 AEAD 加密后仍无法避开，属于本机 OpenSSH 与该服务器的严重不兼容。请升级本机 OpenSSH 客户端，或联系服务器管理员检查 sshd 的加密配置。'
+                }elseif($loginText -match 'Unable to negotiate|no matching host key type|no matching cipher|no matching MAC|no matching key exchange'){
+                    # 算法协商失败：连接在加密协商阶段就断了，根本没到认证，密码对错无从检验；自动修复未能奏效时必须如实报出，绝不能误报成密码错误。
+                    Write-Warning "SSH 算法协商失败（非密码错误）：本机客户端与服务器没有共同可用的算法，自动修复未能奏效。未进行任何平台操作。`n实际错误：$loginText"
                 }elseif($loginText -match 'Connection timed out|Connection refused|Could not resolve hostname|No route to host|Network is unreachable'){
                     # 连接层失败：根本没走到认证，密码是对是错都还无从判断。这类错误绝不能归为“密码错误”，否则用户会反复去改正确的密码，而真正的问题（最常见是端口不对，其次才是防火墙/主机不可达）永远被掩盖。
-                    Write-Warning "无法建立 SSH 连接（端口不通或主机不可达），根本没到认证阶段，因此无法判断密码对错。未进行任何平台操作。请确认端口：若该主机在 ~/.ssh/config 里配了非标准 Port，请用 -p 指定（如 -p 22112），或检查目标主机与网络。\n实际错误：$loginText"
+                    Write-Warning "无法建立 SSH 连接（端口不通或主机不可达），根本没到认证阶段，因此无法判断密码对错。未进行任何平台操作。请确认端口：若该主机在 ~/.ssh/config 里配了非标准 Port，请用 -p 指定（如 -p 22112），或检查目标主机与网络。`n实际错误：$loginText"
                 }elseif($loginText -match 'Not allowed|Connection closed|Connection reset|kex_exchange_identification'){
                     Write-Warning '服务器在认证前主动断开了连接（可能是 fail2ban/防火墙临时封禁或访问控制）。请稍后重试、更换网络或联系管理员。'
                 }else{
-                    Write-Warning "密码认证失败（密码错误）。未进行任何平台操作。\n实际错误：$loginText"
+                    Write-Warning "密码认证失败（密码错误）。未进行任何平台操作。`n实际错误：$loginText"
                 }
                 return
             }
@@ -427,7 +548,7 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
                     Write-Verbose '远程 OpenSSH 默认 shell 为 cmd，尝试切换为 PowerShell……'
                     $切换脚本 = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Set-DefaultShell.ps1') -Raw
                     $切换结果 = 通过scp执行远程Windows脚本 $切换脚本 $sshArguments -远程用户 $RemoteUser -远程端口 $RemotePort -远程主机 $RemoteHost -加密附加参数 $加密附加参数 2>&1
-                    $切换文本 = ($切换结果 | Out-String)
+                    $切换文本 = ($切换结果 | Out-String -Width 65535)
                     if($切换文本 -like '*SHELL_SET*'){
                         Write-Host '远程 OpenSSH 默认 shell 已切换为 PowerShell（Remove-SshId 不会还原此设置）。'
                     }elseif($切换文本 -like '*ALREADY_POWERSHELL*'){
@@ -556,8 +677,8 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
             $密钥文本 = Get-Content -LiteralPath $KeyFile -Raw
         }
 
-        # 同 Copy-SshId：不传默认的 -p 22，让 ssh 从 ~/.ssh/config 的对应 Host 块读取 Port，避免硬编码端口盖掉用户配置导致连接超时
-        $SSH参数 = @()
+        # 同 Copy-SshId：不传默认的 -p 22，让 ssh 从 ~/.ssh/config 的对应 Host 块读取 Port，避免硬编码端口盖掉用户配置导致连接超时；accept-new 同理自动信任首次连接的新主机密钥，避免 yes/no 提示被 2>&1 藏起来卡住
+        $SSH参数 = @('-o', 'StrictHostKeyChecking=accept-new')
         if($PSBoundParameters.ContainsKey('RemotePort')){
             $SSH参数 += @('-p', $RemotePort)
         }
@@ -581,7 +702,7 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
         function 获取远程平台 {
             $检测输出 = ssh @SSH参数 'cmd /c echo __SSH_COPY_ID_WINDOWS__' 2>&1
             $检测退出码 = [int]$LASTEXITCODE
-            $检测文本 = ($检测输出 | Out-String)
+            $检测文本 = ($检测输出 | Out-String -Width 65535)
             if($检测退出码 -eq 0 -and $检测文本 -like '*__SSH_COPY_ID_WINDOWS__*') { return 'Windows' }
             return 'Unix'
         }
@@ -597,9 +718,13 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
             $免密退出码 = $探测结果.免密退出码
 
             if($免密退出码 -ne 0){
-                # 走到这里仍 MAC 损坏说明自动切 AEAD 也修不好，无法判断公钥是否存在，必须如实报出而不能误报成“公钥未生效”
+                # 自动修复后仍失败的两类情况必须如实报出，不能误报成“公钥未生效”
                 if($探测结果.免密输出 -match 'Corrupted MAC|message authentication code incorrect'){
                     Write-Warning '加密通道 MAC 校验失败：自动切换 AEAD 加密后仍无法避开，属于本机 OpenSSH 与该服务器的严重不兼容，无法判断公钥是否存在。请升级本机 OpenSSH 客户端，或联系服务器管理员检查 sshd 的加密配置。未进行任何移除操作。'
+                    return
+                }
+                if($探测结果.免密输出 -match 'Unable to negotiate|no matching host key type'){
+                    Write-Warning "SSH 算法协商失败：自动修复未能奏效，无法判断公钥是否存在。未进行任何移除操作。实际错误：$($探测结果.免密输出)"
                     return
                 }
                 Write-Host '目标主机上本机公钥未生效（无法免密登录），无需移除。'
