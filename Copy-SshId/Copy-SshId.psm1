@@ -229,7 +229,35 @@ function 写入-主机密钥兼容配置 {
     }
 }
 
-# 探测免密登录的同时自动检测并修复两类兼容性问题，全程自动（含自动写用户级 ssh config），不把修复步骤丢给用户：
+# 移除指定主机的旧算法兼容块（当检测到该主机实际协商的是现代主机密钥算法、根本不需旧算法时调用，自动清理过期残留）。
+# 场景：Host 别名被改指向新机器（如学校集群从 OpenSSH 5.3 的 .109 改到 7.4 的 .110），上一轮为旧机器写的兼容块成了过期脏数据，会让模块误判“旧服务器”、多此一举换 RSA。检测到主机协商的是现代算法就自动清掉，无需人工干预。
+# 幂等：没有该块则什么都不做；有则先备份再删。返回 $true=本次删除，$false=无需删或失败。
+function 移除-主机密钥兼容配置 {
+    param([string]$主机名)
+    if([string]::IsNullOrWhiteSpace($主机名)){ return $false }
+    $config路径 = Join-Path (Join-Path $env:USERPROFILE '.ssh') 'config'
+    if(-not (Test-Path -LiteralPath $config路径)){ return $false }
+    $现有内容 = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($config路径))
+    $起始标记 = "# BEGIN Copy-SshId HOSTKEY-FIX $主机名"
+    $结束标记 = "# END Copy-SshId HOSTKEY-FIX $主机名"
+    if(-not $现有内容.Contains($起始标记)){ return $false }
+    try{
+        Copy-Item -LiteralPath $config路径 -Destination "$config路径.Copy-SshId备份_$(Get-Date -Format 'yyyyMMdd_HHmmss')" -ErrorAction Stop
+        # 删除整个标记块（含 BEGIN/END 行及其间内容及尾部换行）；用 regex.Escape 确保中文主机名也能精确匹配
+        $块正则 = [regex]::Escape($起始标记) + '.*?' + [regex]::Escape($结束标记) + '\r?\n?'
+        $新内容 = [regex]::Replace($现有内容, "(?ms)$块正则", '')
+        # 顺手把删块后可能残留的连续空行收成一个空行，避免 config 变稀疏
+        $新内容 = $新内容 -replace '(\r?\n){3,}', "`r`n`r`n"
+        [IO.File]::WriteAllBytes($config路径, [Text.Encoding]::UTF8.GetBytes($新内容))
+        Write-Host "检测到 $主机名 实际协商的是现代主机密钥算法，已自动清理过期的旧算法兼容配置块（无需人工操作）。"
+        return $true
+    }catch{
+        Write-Warning "自动清理过期 ssh config 块失败：$($_.Exception.Message)"
+        return $false
+    }
+}
+
+# 探测免密登录的同时自动检测并修复两类兼容性问题，全程自动（含自动写/清理用户级 ssh config），不把修复步骤丢给用户：
 #   1) 主机密钥类型协商失败：老服务器（如 OpenSSH 5.x）只提供 ssh-rsa/ssh-dss，新版客户端默认不再接受，报 "Unable to negotiate ... no matching host key type found"。自动改用旧算法参数重试并写 config（见 写入-主机密钥兼容配置）；这类服务器也不支持 ed25519 用户公钥，故同时置 旧服务器 标志，调用方应改用 RSA 密钥。
 #   2) umac MAC 计算缺陷：协商到 umac-*-etm 时报 "Corrupted MAC on input"。自动改用 AEAD 加密重试并全局降权 umac 写 config（见 写入-Umac降权配置）。
 # 返回 [PSCustomObject]：免密输出、免密退出码（生效参数下的最终探测结果，调用方直接复用避免重复连接）、附加参数（调用方应将其前置到 SSH 参数数组开头，即主机名之前）、旧服务器（$true=服务器过老，用户公钥须用 RSA/DSA 而非 ed25519）。
@@ -240,19 +268,18 @@ function 探测免密登录并修复加密 {
     $旧算法参数 = @('-o', 'HostKeyAlgorithms=+ssh-rsa,ssh-dss', '-o', 'PubkeyAcceptedAlgorithms=+ssh-rsa,ssh-dss')
     $附加参数 = @()
 
-    # 旧服务器标志：本次探测命中协商失败、或之前已为该主机写过兼容块（否则第二次运行会因协商已修好而漏判，误把 ed25519 装到不支持它的老服务器上）
-    $旧服务器 = $false
-    $config路径 = Join-Path (Join-Path $env:USERPROFILE '.ssh') 'config'
-    if(Test-Path -LiteralPath $config路径){
-        $配置内容 = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($config路径))
-        if($配置内容.Contains("# BEGIN Copy-SshId HOSTKEY-FIX $主机名")){ $旧服务器 = $true }
-    }
-
-    # -Width 65535 必须加：Out-String 默认按控制台宽度（约120）折行，会在长错误消息中间插 CR+LF，把 "no matching host key type" 拆成 "ty\r\npe" 导致下方正则永远匹配不上
-    $输出 = ssh -o BatchMode=yes @SSH参数 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1 | Out-String -Width 65535
+    # -Width 65535 必须加：Out-String 默认按控制台宽度（约120）折行，会在长错误消息中间插 CR+LF，把 "no matching host key type" 拆成 "ty\r\npe" 导致下方正则永远匹配不上。
+    # 探测时加 -v 以便解析实际协商到的主机密钥算法：这是判断服务器新旧的可靠依据（现代=ed25519/rsa-sha2/ecdsa-sha2/sk-，旧=ssh-rsa/ssh-dss）。不用 config 标记判断新旧——Host 别名被改指向新机器后旧标记会误导模块。
+    $输出 = ssh -v -o BatchMode=yes @SSH参数 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1 | Out-String -Width 65535
     $退出码 = [int]$LASTEXITCODE
 
+    $协商算法 = ''
+    $算法匹配 = [regex]::Match($输出, 'kex: host key algorithm:\s*(\S+)')
+    if($算法匹配.Success){ $协商算法 = $算法匹配.Groups[1].Value }
+
+    $旧服务器 = $false
     if($输出 -match 'no matching host key type'){
+        # 协商失败：服务器只提供 ssh-rsa/ssh-dss 旧算法，自动改用旧算法参数重试并写 config
         $旧服务器 = $true
         Write-Verbose '检测到主机密钥类型协商失败：服务器只提供 ssh-rsa/ssh-dss 等旧算法，自动启用兼容参数并重试…'
         $null = 写入-主机密钥兼容配置 -主机名 $主机名
@@ -263,7 +290,15 @@ function 探测免密登录并修复加密 {
             return [PSCustomObject]@{ 免密输出 = $输出; 免密退出码 = $退出码; 附加参数 = $附加参数; 旧服务器 = $旧服务器 }
         }
         Write-Host '已自动修复主机密钥类型协商问题（已为该主机启用 ssh-rsa/ssh-dss 旧算法兼容），无需修改任何配置文件。'
+    } elseif($协商算法 -match '^(ssh-rsa|ssh-dss)$'){
+        # 协商到旧算法（即便连接成功）：服务器偏老，确保兼容块存在以支持后续免密
+        $旧服务器 = $true
+        $null = 写入-主机密钥兼容配置 -主机名 $主机名
+    } elseif($协商算法 -match 'ed25519|rsa-sha2|ecdsa-sha2|sk-'){
+        # 协商到现代算法：服务器现代、根本不需旧算法块 → 自动清理可能残留的过期兼容块（如别名改指向新机器后遗留的脏数据）
+        $null = 移除-主机密钥兼容配置 -主机名 $主机名
     }
+    # else：无法确定协商算法（网络抖动等），保持现状不动，避免误删
 
     if($输出 -match 'Corrupted MAC|message authentication code incorrect'){
         Write-Verbose '检测到加密层 MAC 校验失败：本机 OpenSSH 的 umac 实现缺陷被触发，自动降权 umac 并改用 AEAD 加密优先重试…'
@@ -526,7 +561,8 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
                     # 连接层失败：根本没走到认证，密码是对是错都还无从判断。这类错误绝不能归为“密码错误”，否则用户会反复去改正确的密码，而真正的问题（最常见是端口不对，其次才是防火墙/主机不可达）永远被掩盖。
                     Write-Warning "无法建立 SSH 连接（端口不通或主机不可达），根本没到认证阶段，因此无法判断密码对错。未进行任何平台操作。请确认端口：若该主机在 ~/.ssh/config 里配了非标准 Port，请用 -p 指定（如 -p 22112），或检查目标主机与网络。`n实际错误：$loginText"
                 }elseif($loginText -match 'Not allowed|Connection closed|Connection reset|kex_exchange_identification'){
-                    Write-Warning '服务器在认证前主动断开了连接（可能是 fail2ban/防火墙临时封禁或访问控制）。请稍后重试、更换网络或联系管理员。'
+                    # 这类"连接被断开"的文案只作辅助判断，绝不能作为唯一结论——真实原因可能是网络抖动、fail2ban、账号锁定、或密码认证期的服务器侧行为。必须把 ssh 原始报错一并透出，否则用户只会看到一句猜测而无从判断（这是本模块反复踩过的"上层文案掩盖底层错误"教训）。
+                    Write-Warning "SSH 连接在认证阶段被断开（原因待查，不一定是 fail2ban）。未进行任何平台操作。`n实际错误：$loginText"
                 }else{
                     Write-Warning "密码认证失败（密码错误）。未进行任何平台操作。`n实际错误：$loginText"
                 }
