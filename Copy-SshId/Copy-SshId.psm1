@@ -1,7 +1,5 @@
 # ===== askpass 密码复用（单次密码）=====
-# 原理：OpenSSH 从 TTY 读密码，不接受 stdin 管道；但设置了 SSH_ASKPASS（且 DISPLAY、
-# SSH_ASKPASS_REQUIRE=force）后会改从该程序读密码。这里收集一次密码存入进程环境变量，
-# SSH_ASKPASS 指向模块内固定的辅助脚本（Read-SshPassword.ps1），脚本从环境变量读密码——
+# 原理：OpenSSH 从 TTY 读密码，不接受 stdin 管道；但设置了 SSH_ASKPASS（且 DISPLAY、SSH_ASKPASS_REQUIRE=force）后会改从该程序读密码。这里收集一次密码存入进程环境变量，SSH_ASKPASS指向模块内固定的辅助脚（Read-SshPassword.ps1），脚本从环境变量读密码——
 # 之后每次 ssh 连接都自动复用同一密码。不落盘、无后台进程、无临时文件。
 
 # 收集一次密码（SecureString），返回明文供环境变量传递（用完即清）
@@ -62,11 +60,8 @@ function 停止-Askpass服务 {
 # 在远程 Windows 主机执行 PowerShell 脚本：scp 上传 + EncodedCommand 引导执行（不用 stdin 管道、不用超长命令行）。
 # 方案演进：
 #   1) stdin 管道（远端 [Console]::In.ReadToEnd()）：经 cpolar 等 NAT 隧道时 EOF 有时送达不了 → 永久挂起；
-#   2) 整脚本 base64 内嵌进 ssh 命令参数：脚 base64 后约 7KB，超 cmd 命令行 8191 上限
-#      → 'The command line is too long.'；
-#   3) 现行方案：脚本写本地临时文件 → scp -O 上传到远端用户目录（文件传输走数据通道，
-#      隧道下同样稳定）→ 一条短命令经 -EncodedCommand 引导执行（纯 base64，远端默认 shell
-#      无论是 cmd 还是 PowerShell 都不会拆解它），引导脚本执行完毕自行删除远端临时文件。
+#   2) 整脚本 base64 内嵌进 ssh 命令参数：脚 base64 后约 7KB，超 cmd 命令行 8191 上限→'The command line is too long.'；
+#   3) 现行方案：脚本写本地临时文件 → scp -O 上传到远端用户目录（文件传输走数据通道，隧道下同样稳定）→ 一条短命令经 -EncodedCommand 引导执行（纯 base64，远端默认shell无论是 cmd 还是 PowerShell 都不会拆解它），引导脚本执行完毕自行删除远端临时文件。
 function 通过scp执行远程Windows脚本 {
     param([string]$脚本内容, [string[]]$SSH参数, [string]$远程用户, [string]$远程端口, [string]$远程主机, [string[]]$加密附加参数 = @())
 
@@ -257,7 +252,126 @@ function 移除-主机密钥兼容配置 {
     }
 }
 
-# 探测免密登录的同时自动检测并修复两类兼容性问题，全程自动（含自动写/清理用户级 ssh config），不把修复步骤丢给用户：
+# 已知主机密钥发生变化时，交互式询问用户是否接受新密钥，并在确认后安全更新 known_hosts。
+# 安全约束：必须显示当前新指纹和能查到的历史指纹；只有用户准确输入 yes 才继续；先备份；更新后重新协商并核对实际收到的指纹必须与用户确认的完全一致，否则立即恢复备份。绝不把 StrictHostKeyChecking=no 当作解决办法，也绝不静默接受变化密钥。
+# 返回对象：成功（是否已确认并完成更新）、输出与退出码（更新成功后 BatchMode 复查连接的结果，供调用方直接复用，避免重复连接）。KnownHosts路径 参数默认使用当前用户文件，主要用于隔离验证。
+function 确认并更新变化的主机密钥 {
+    param(
+        [string[]]$SSH参数,
+        [string]$错误文本,
+        [string]$KnownHosts路径 = (Join-Path $env:USERPROFILE '.ssh\known_hosts')
+    )
+
+    $失败结果 = {
+        param([string]$输出 = $错误文本, [int]$退出码 = 255)
+        return [PSCustomObject]@{ 成功 = $false; 输出 = $输出; 退出码 = $退出码 }
+    }
+    $主机名 = $SSH参数[-1]
+    $新算法 = ''
+    $新指纹 = ''
+    $指纹匹配 = [regex]::Match($错误文本, 'Server host key:\s*(\S+)\s+(SHA256:[A-Za-z0-9+/=]+)')
+    if($指纹匹配.Success){
+        $新算法 = $指纹匹配.Groups[1].Value
+        $新指纹 = $指纹匹配.Groups[2].Value
+    }else{
+        $指纹匹配 = [regex]::Match($错误文本, 'fingerprint for the\s+(\S+)\s+key.*?[\r\n]+\s*(SHA256:[A-Za-z0-9+/=]+)', 'Singleline')
+        if($指纹匹配.Success){
+            $新算法 = $指纹匹配.Groups[1].Value
+            $新指纹 = $指纹匹配.Groups[2].Value
+        }
+    }
+    if(-not $新指纹){
+        Write-Warning '无法从 SSH 输出中解析新的主机密钥指纹，不能安全地请求确认；未修改 known_hosts。'
+        return (& $失败结果)
+    }
+
+    # 用 ssh -G 解析真实 HostName/Port/HostKeyAlias，删除旧记录时同时覆盖用户输入别名、实际主机名和非默认端口的 [host]:port 形式；ssh-keygen -R 可直接处理哈希记录
+    $实际主机 = $主机名
+    $端口 = '22'
+    $主机密钥别名 = ''
+    $G文本 = ssh -G @SSH参数 2>$null | Out-String -Width 65535
+    $匹配 = [regex]::Match($G文本, '(?m)^hostname\s+(\S+)\s*$')
+    if($匹配.Success){ $实际主机 = $匹配.Groups[1].Value }
+    $匹配 = [regex]::Match($G文本, '(?m)^port\s+(\d+)\s*$')
+    if($匹配.Success){ $端口 = $匹配.Groups[1].Value }
+    $匹配 = [regex]::Match($G文本, '(?m)^hostkeyalias\s+(\S+)\s*$')
+    if($匹配.Success){ $主机密钥别名 = $匹配.Groups[1].Value }
+
+    $记录名列表 = @($主机名, $实际主机, $主机密钥别名) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+    if($端口 -ne '22'){
+        $记录名列表 = @($记录名列表 | ForEach-Object { $_, "[$_]:$端口" } | Select-Object -Unique)
+    }
+
+    Write-Warning "服务器 $主机名 的主机密钥与 known_hosts 历史记录不一致。可能是服务器重装/换机或别名解析变化，也可能是中间人攻击。"
+    Write-Host "当前新密钥：$新算法"
+    Write-Host "当前新指纹：$新指纹"
+    $找到旧指纹 = $false
+    foreach($记录名 in $记录名列表){
+        if(-not (Test-Path -LiteralPath $KnownHosts路径 -PathType Leaf)){ break }
+        $旧指纹 = ssh-keygen -lf $KnownHosts路径 -F $记录名 2>$null | Out-String -Width 65535
+        if($旧指纹.Trim()){
+            if(-not $找到旧指纹){ Write-Host 'known_hosts 中的历史指纹：'; $找到旧指纹 = $true }
+            Write-Host $旧指纹.TrimEnd()
+        }
+    }
+    if(-not $找到旧指纹){ Write-Host '未在 known_hosts 中查到可显示的历史指纹（记录可能已哈希或使用了其他主机名）。' }
+    Write-Host '请先通过其他可信渠道向管理员核实上述新指纹；不要在未核实的情况下接受。'
+    try{
+        $答复 = Read-Host '确认新指纹属于目标主机并替换旧记录？仅输入 yes 接受，其他输入均取消'
+    }catch{
+        Write-Warning "当前环境无法进行交互确认，未修改 known_hosts：$($_.Exception.Message)"
+        return (& $失败结果)
+    }
+    if($答复 -cne 'yes'){
+        Write-Host '用户未接受新主机密钥，操作已取消，known_hosts 未修改。'
+        return (& $失败结果)
+    }
+
+    $原文件存在 = Test-Path -LiteralPath $KnownHosts路径 -PathType Leaf
+    $备份路径 = "$KnownHosts路径.Copy-SshId备份_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    try{
+        $父目录 = Split-Path -Parent $KnownHosts路径
+        if($父目录 -and -not (Test-Path -LiteralPath $父目录)){ $null = New-Item -Path $父目录 -ItemType Directory -ErrorAction Stop }
+        if($原文件存在){ Copy-Item -LiteralPath $KnownHosts路径 -Destination $备份路径 -ErrorAction Stop }
+        foreach($记录名 in $记录名列表){
+            if(-not (Test-Path -LiteralPath $KnownHosts路径 -PathType Leaf)){ break }
+            $移除输出 = ssh-keygen -R $记录名 -f $KnownHosts路径 2>&1 | Out-String -Width 65535
+            if($LASTEXITCODE -ne 0 -and $移除输出 -notmatch 'not found'){
+                throw "删除 $记录名 的旧主机密钥记录失败：$移除输出"
+            }
+        }
+
+        # accept-new 只接受“已知记录已被删除后的新主机”，不会绕过变化密钥校验；这里由 SSH 自己按正确的主机名/端口格式写回记录，避免手工拼接 known_hosts 主机字段
+        $已知文件选项 = 'UserKnownHostsFile="' + $KnownHosts路径 + '"'
+        $复查输出 = ssh -v -o BatchMode=yes -o $已知文件选项 @SSH参数 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1 | Out-String -Width 65535
+        $复查退出码 = [int]$LASTEXITCODE
+        $复查指纹匹配 = [regex]::Match($复查输出, 'Server host key:\s*\S+\s+(SHA256:[A-Za-z0-9+/=]+)')
+        if($复查输出 -match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'){
+            throw '更新后仍无法通过主机密钥验证，可能还有其他旧记录未被替换。'
+        }
+        if(-not $复查指纹匹配.Success -or $复查指纹匹配.Groups[1].Value -cne $新指纹){
+            $实际指纹 = if($复查指纹匹配.Success){ $复查指纹匹配.Groups[1].Value } else { '未能解析' }
+            throw "更新后实际收到的指纹（$实际指纹）与用户确认的指纹（$新指纹）不一致。"
+        }
+        Write-Host "已接受并保存 $主机名 的新主机密钥；旧记录备份在：$备份路径"
+        return [PSCustomObject]@{ 成功 = $true; 输出 = $复查输出; 退出码 = $复查退出码 }
+    }catch{
+        try{
+            if($原文件存在 -and (Test-Path -LiteralPath $备份路径)){
+                Copy-Item -LiteralPath $备份路径 -Destination $KnownHosts路径 -Force -ErrorAction Stop
+            }elseif(-not $原文件存在 -and (Test-Path -LiteralPath $KnownHosts路径)){
+                Remove-Item -LiteralPath $KnownHosts路径 -Force -ErrorAction Stop
+            }
+            Write-Warning "新主机密钥未通过复核，已恢复 known_hosts 原状：$($_.Exception.Message)"
+        }catch{
+            Write-Warning "新主机密钥复核失败，且恢复 known_hosts 备份也失败：$($_.Exception.Message)。请保留现场并检查备份 $备份路径。"
+        }
+        return (& $失败结果 -输出 $复查输出 -退出码 $复查退出码)
+    }
+}
+
+# 探测免密登录的同时自动处理主机密钥变化并修复两类算法兼容性问题：变化密钥必须由用户交互确认，其他可确定的兼容性问题自动修复，全程不需要用户手动编辑配置：
+#   0) 已知主机密钥变化：显示新旧指纹并询问，只有用户输入 yes 才备份并更新 known_hosts；更新后复核实际指纹，异常则恢复备份。
 #   1) 主机密钥类型协商失败：老服务器（如 OpenSSH 5.x）只提供 ssh-rsa/ssh-dss，新版客户端默认不再接受，报 "Unable to negotiate ... no matching host key type found"。自动改用旧算法参数重试并写 config（见 写入-主机密钥兼容配置）；这类服务器也不支持 ed25519 用户公钥，故同时置 旧服务器 标志，调用方应改用 RSA 密钥。
 #   2) umac MAC 计算缺陷：协商到 umac-*-etm 时报 "Corrupted MAC on input"。自动改用 AEAD 加密重试并全局降权 umac 写 config（见 写入-Umac降权配置）。
 # 返回 [PSCustomObject]：免密输出、免密退出码（生效参数下的最终探测结果，调用方直接复用避免重复连接）、附加参数（调用方应将其前置到 SSH 参数数组开头，即主机名之前）、旧服务器（$true=服务器过老，用户公钥须用 RSA/DSA 而非 ed25519）。
@@ -272,6 +386,16 @@ function 探测免密登录并修复加密 {
     # 探测时加 -v 以便解析实际协商到的主机密钥算法：这是判断服务器新旧的可靠依据（现代=ed25519/rsa-sha2/ecdsa-sha2/sk-，旧=ssh-rsa/ssh-dss）。不用 config 标记判断新旧——Host 别名被改指向新机器后旧标记会误导模块。
     $输出 = ssh -v -o BatchMode=yes @SSH参数 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1 | Out-String -Width 65535
     $退出码 = [int]$LASTEXITCODE
+
+    if($输出 -match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'){
+        $密钥处理 = 确认并更新变化的主机密钥 -SSH参数 $SSH参数 -错误文本 $输出
+        if(-not $密钥处理.成功){
+            return [PSCustomObject]@{ 免密输出 = $密钥处理.输出; 免密退出码 = $密钥处理.退出码; 附加参数 = $附加参数; 旧服务器 = $false }
+        }
+        # 用户已明确确认且指纹复核一致：复用处理函数返回的复查连接结果，不重复连接
+        $输出 = $密钥处理.输出
+        $退出码 = $密钥处理.退出码
+    }
 
     $协商算法 = ''
     $算法匹配 = [regex]::Match($输出, 'kex: host key algorithm:\s*(\S+)')
@@ -512,6 +636,12 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
                 return
             }
 
+            # 用户拒绝确认新密钥或复核失败时在此停止；正常情况下已在探测函数内完成交互和更新，不会走到这里
+            if($探测结果.免密输出 -match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'){
+                Write-Warning '服务器主机密钥未得到确认，操作已取消，未继续安装，也未自动接受不受信任的密钥。'
+                return
+            }
+
             # 老服务器（如 OpenSSH 5.x）不支持 ed25519/ecdsa 用户公钥（6.5 才引入），装上去也永远无法免密；自动改用 RSA 密钥（本机没有就生成），否则整个安装毫无意义
             if($探测结果.旧服务器){
                 $公钥类型 = ((Get-Content -LiteralPath $KeyFile -Raw).Trim() -split '\s+')[0]
@@ -550,8 +680,21 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
             $loginOutput = ssh @sshArguments 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1
             $loginExit = [int]$LASTEXITCODE
             $loginText = ($loginOutput | Out-String -Width 65535)
+            # 若密钥在免密探测与密码登录之间又发生变化，仍按同一安全流程询问；用户确认后重新执行密码登录，BatchMode 复查结果不能代替本次认证
+            if($loginExit -ne 0 -and $loginText -match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'){
+                $密钥处理 = 确认并更新变化的主机密钥 -SSH参数 $sshArguments -错误文本 $loginText
+                if(-not $密钥处理.成功){
+                    Write-Warning '服务器主机密钥未得到确认，操作已取消，未继续安装。'
+                    return
+                }
+                $loginOutput = ssh @sshArguments 'echo __SSH_COPY_ID_LOGIN_OK__' 2>&1
+                $loginExit = [int]$LASTEXITCODE
+                $loginText = ($loginOutput | Out-String -Width 65535)
+            }
             if($loginExit -ne 0){
-                if($loginText -match 'Corrupted MAC|message authentication code incorrect'){
+                if($loginText -match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'){
+                    Write-Warning "服务器主机密钥验证失败（非密码错误）：当前密钥与 known_hosts 历史记录不一致。未自动接受新密钥，请先向管理员核实新指纹。`n实际错误：$loginText"
+                }elseif($loginText -match 'Corrupted MAC|message authentication code incorrect'){
                     # 走到这里说明已由探测阶段自动切换 AEAD 重试后仍然 MAC 损坏，属于更严重的加密层不兼容。这不是密码错误，必须如实报出，绝不能误报成密码错误让用户反复试密码。
                     Write-Warning '加密通道 MAC 校验失败（非密码错误）：自动切换 AEAD 加密后仍无法避开，属于本机 OpenSSH 与该服务器的严重不兼容。请升级本机 OpenSSH 客户端，或联系服务器管理员检查 sshd 的加密配置。'
                 }elseif($loginText -match 'Unable to negotiate|no matching host key type|no matching cipher|no matching MAC|no matching key exchange'){
@@ -754,7 +897,11 @@ https://github.com/Ebola-Chan-bot/Copy-SshId
             $免密退出码 = $探测结果.免密退出码
 
             if($免密退出码 -ne 0){
-                # 自动修复后仍失败的两类情况必须如实报出，不能误报成“公钥未生效”
+                # 自动修复后仍失败的几类情况必须如实报出，不能误报成“公钥未生效”
+                if($探测结果.免密输出 -match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'){
+                    Write-Warning '服务器主机密钥未得到确认，操作已取消，未进行任何移除操作，也未自动接受不受信任的密钥。'
+                    return
+                }
                 if($探测结果.免密输出 -match 'Corrupted MAC|message authentication code incorrect'){
                     Write-Warning '加密通道 MAC 校验失败：自动切换 AEAD 加密后仍无法避开，属于本机 OpenSSH 与该服务器的严重不兼容，无法判断公钥是否存在。请升级本机 OpenSSH 客户端，或联系服务器管理员检查 sshd 的加密配置。未进行任何移除操作。'
                     return
